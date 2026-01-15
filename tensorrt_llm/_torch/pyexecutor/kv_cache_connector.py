@@ -245,6 +245,17 @@ class KvCacheConnectorScheduler(ABC):
         Provide the scheduler with the handshake metadata for the workers.
         """
 
+    @abstractmethod
+    def update_connector_output(self, finished_sending: List[int],
+                                finished_recving: List[int]):
+        """
+        Update the scheduler with the finished requests.
+
+        Args:
+            finished_sending: The IDs of the requests that have finished sending.
+            finished_recving: The IDs of the requests that have finished receiving.
+        """
+
 
 # An internal dataclass to handle async saving/loading requests.
 @dataclass
@@ -564,7 +575,10 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             req.state = LlmRequestState.CONTEXT_INIT
             self.finished_async_loading_requests[id] = req
 
-        # TODO: Some call to update_connector_output here.
+        if self.scheduler is not None:
+            self.scheduler.update_connector_output(
+                list(intersect_finished_saving),
+                list(intersect_finished_loading))
 
         # Return the requests that have finished saving.
         # The execution loop will call _terminate_request on these requests.
