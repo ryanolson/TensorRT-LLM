@@ -1,8 +1,10 @@
 import dataclasses
 import datetime
 import functools
+import http.server
 import os
 import pickle  # nosec B403
+import socketserver
 import threading
 import time
 import traceback
@@ -66,8 +68,58 @@ PROFILE_START_STOP_ENV_VAR_NAME = "TLLM_PROFILE_START_STOP"
 # Set to a path to save detailed tracing of PyTorch operations.
 PROFILE_TRACE_ENV_VAR_NAME = "TLLM_TORCH_PROFILE_TRACE"
 
+# Environment variable to enable the cache reset HTTP server.
+# Set to a port number (e.g., "9999") to enable the server on that port.
+CACHE_RESET_SERVER_PORT_ENV_VAR_NAME = "TRTLLM_CACHE_RESET_SERVER_PORT"
+
 # Unique tag base to avoid collisions with token/logits comms
 TERMINATION_COMM_TAG_BASE = 20000
+
+
+def _create_cache_reset_request_handler(executor: "PyExecutor"):
+    """Factory function to create a request handler with access to the executor."""
+
+    class CacheResetRequestHandler(http.server.BaseHTTPRequestHandler):
+        """HTTP request handler for cache reset operations."""
+
+        def log_message(self, format, *args):
+            """Override to use tensorrt_llm logger instead of stderr."""
+            logger.info(f"[CacheResetServer] {format % args}")
+
+        def _send_response(self, code: int, message: str):
+            """Helper to send a response with the given code and message."""
+            self.send_response(code)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(message.encode("utf-8"))
+
+        def do_POST(self):
+            """Handle POST requests."""
+            self._handle_request()
+
+        def do_PUT(self):
+            """Handle PUT requests."""
+            self._handle_request()
+
+        def _handle_request(self):
+            """Handle the actual request logic."""
+            if self.path == "/reset_prefix_cache":
+                try:
+                    executor.reset_prefix_cache()
+                    self._send_response(
+                        200, "Prefix cache reset successfully\n")
+                    logger.info(
+                        "[CacheResetServer] Prefix cache reset triggered")
+                except Exception as e:
+                    error_msg = f"Failed to reset prefix cache: {e}\n"
+                    self._send_response(500, error_msg)
+                    logger.error(f"[CacheResetServer] {error_msg}")
+            else:
+                self._send_response(404, f"Unknown endpoint: {self.path}\n")
+
+    return CacheResetRequestHandler
+
+
 PP_COMM_TAG_SCHEDULE_RESULT = 21000
 PP_COMM_TAG_SAMPLE_STATE_BASE = 21001
 
@@ -338,6 +390,10 @@ class PyExecutor:
         self.worker_started = False
         self.worker_lock = threading.Lock()
 
+        # Cache reset HTTP server (initialized in _start_cache_reset_server if enabled)
+        self._cache_reset_server = None
+        self._cache_reset_server_thread = None
+
         self.kv_connector_manager = kv_connector_manager
 
         self._maybe_init_kv_connector_manager()
@@ -410,6 +466,8 @@ class PyExecutor:
             if (isinstance(self.sampler, AsyncWorkerMixin)
                     and self.sampler.async_worker_enabled()):
                 self.sampler.async_worker_start()
+            # Start the cache reset HTTP server if enabled via env var
+            self._start_cache_reset_server()
 
     def _set_global_steady_clock_offset(self):
         assert self.global_rank >= 0, "rank should be >= 0"
@@ -1365,6 +1423,10 @@ class PyExecutor:
                         self.ctx_in_transmission_requests[req.py_request_id] = (
                             request, block_id, counter - 1)
 
+    def _kv_connector_clear_connector_meta(self):
+        if self.kv_connector_manager:
+            self.kv_connector_manager.worker.clear_connector_meta()
+
     def _kv_connector_wait_for_save(self):
         if self.kv_connector_manager is not None:
             self.kv_connector_manager.worker.wait_for_save(
@@ -1506,6 +1568,8 @@ class PyExecutor:
                                    iter_stats=iter_stats,
                                    iter_start_time=iter_start_time))
 
+                self._kv_connector_clear_connector_meta()
+
                 self.iter_counter += 1
 
     def _prepare_draft_requests(self):
@@ -1534,8 +1598,8 @@ class PyExecutor:
 
     def _handle_control_request(self):
         if len(self.active_requests) == 0 and \
-            self.executor_request_queue.get_waiting_queue_size() == 0 and \
-            len(self.executor_request_queue.control_requests) > 0:
+                self.executor_request_queue.get_waiting_queue_size() == 0 and \
+                len(self.executor_request_queue.control_requests) > 0:
             assert len(self.executor_request_queue.control_requests) == 1, (
                 f"Expected exactly one control request to be processed at a time, "
                 f"but found {len(self.executor_request_queue.control_requests)} control requests. "
@@ -1772,6 +1836,8 @@ class PyExecutor:
 
                 self._kv_connector_terminate_requests()
 
+                self._kv_connector_clear_connector_meta()
+
                 self.iter_counter += 1
 
     @nvtx_range("_accept_draft_tokens")
@@ -1803,7 +1869,8 @@ class PyExecutor:
         has_draft_tokens = target_inputs is not None and isinstance(
             target_inputs, SampleStateTensorsMTP
         ) and target_inputs.next_draft_tokens is not None
-        target_tokens = target_outputs.new_tokens  # [max_draft_len + 1, batch_size, beam_width] or [1, batch_size, beam_width]
+        # [max_draft_len + 1, batch_size, beam_width] or [1, batch_size, beam_width]
+        target_tokens = target_outputs.new_tokens
         new_tokens = torch.zeros_like(target_tokens)
 
         # Squeeze the beam dimension (beam_width=1 for greedy or single beam)
@@ -1819,7 +1886,8 @@ class PyExecutor:
 
         if has_draft_tokens:
             # Draft tokens exist, compute acceptance
-            draft_tokens = target_inputs.next_draft_tokens  # [batch_size, max_draft_len]
+            # [batch_size, max_draft_len]
+            draft_tokens = target_inputs.next_draft_tokens
             max_draft_len = draft_tokens.shape[1]
 
             # Compute number of accepted tokens per request
@@ -2094,7 +2162,8 @@ class PyExecutor:
             current_time = time.time()
             if req.py_kv_transfer_start_time is None:
                 return
-            elapsed_time = (current_time - req.py_kv_transfer_start_time) * 1000
+            elapsed_time = (
+                current_time - req.py_kv_transfer_start_time) * 1000
             if elapsed_time > timeout_ms and not req.py_kv_transfer_timed_out:
                 logger.warning(
                     f"Terminating {type} request {req.py_request_id} due to KV cache transfer timeout"
@@ -2217,7 +2286,8 @@ class PyExecutor:
             req.is_disagg_generation_transmission_in_progress
             for req in self.active_requests
         ])
-        self._check_disagg_gen_cache_transfer_status(1 if block_transfer else 0)
+        self._check_disagg_gen_cache_transfer_status(
+            1 if block_transfer else 0)
 
         return
 
@@ -2616,7 +2686,8 @@ class PyExecutor:
 
             # Check if generation request needs cleanup due to KV cache transfer timeout
             if request.py_kv_transfer_timed_out:
-                is_cancelled = self.kv_cache_transceiver.cancel_request(request)
+                is_cancelled = self.kv_cache_transceiver.cancel_request(
+                    request)
                 if is_cancelled:
                     self._handle_errors(
                         error_msg=f"Request {request.py_request_id} timed out",
@@ -2706,7 +2777,8 @@ class PyExecutor:
                 request_id]
 
             if request.py_kv_transfer_timed_out:
-                is_cancelled = self.kv_cache_transceiver.cancel_request(request)
+                is_cancelled = self.kv_cache_transceiver.cancel_request(
+                    request)
                 # If cancel is successful, mark as complete so it can be cleaned up
                 # Otherwise, try at next iteration
                 if is_cancelled:
@@ -2863,6 +2935,55 @@ class PyExecutor:
     def reset_prefix_cache(self):
         self.kv_cache_manager.reset_reuse_state()
 
+    def _start_cache_reset_server(self):
+        """Start the HTTP server for cache reset operations if enabled via env var.
+
+        The server is controlled by the TRTLLM_CACHE_RESET_SERVER_PORT environment
+        variable. When set to a port number (e.g., "9999"), the server starts on
+        that port. When unset or empty, the server is disabled.
+
+        Usage:
+            export TRTLLM_CACHE_RESET_SERVER_PORT=9999
+            curl -X POST http://localhost:9999/reset_prefix_cache
+        """
+        port_str = os.environ.get(CACHE_RESET_SERVER_PORT_ENV_VAR_NAME, "")
+        if not port_str:
+            return
+
+        try:
+            port = int(port_str)
+        except ValueError:
+            logger.warning(
+                f"[CacheResetServer] Invalid port value '{port_str}' in "
+                f"{CACHE_RESET_SERVER_PORT_ENV_VAR_NAME}, server not started"
+            )
+            return
+
+        handler_class = _create_cache_reset_request_handler(self)
+
+        # Allow address reuse to avoid "Address already in use" errors
+        socketserver.TCPServer.allow_reuse_address = True
+
+        try:
+            server = socketserver.TCPServer(("", port), handler_class)
+        except OSError as e:
+            logger.error(
+                f"[CacheResetServer] Failed to start server on port {port}: {e}"
+            )
+            return
+
+        def serve_forever():
+            logger.info(
+                f"[CacheResetServer] Starting HTTP server on port {port} "
+                f"(POST/PUT /reset_prefix_cache to reset KV cache)"
+            )
+            server.serve_forever()
+
+        server_thread = threading.Thread(target=serve_forever, daemon=True)
+        server_thread.start()
+        self._cache_reset_server = server
+        self._cache_reset_server_thread = server_thread
+
     def _handle_guided_decoder_errors(
             self, scheduled_batch: ScheduledRequests,
             failed_requests: Optional[List[Tuple[int, str]]]):
@@ -2950,7 +3071,8 @@ class DisaggPPTerminationHandler:
         else:
             # other pp ranks pass the updated ready dict and terminate request ids to the next rank, and the
             # terminate_req_ids will not change in a given iteration, so we can terminate the requests synchronously
-            new_term_state = {"ready": ready_req_map, "term": terminate_req_ids}
+            new_term_state = {"ready": ready_req_map,
+                              "term": terminate_req_ids}
 
         self._send_handle = self._dist.isend_object(
             new_term_state, dest=self._dist.next_pp_rank, tag=self._comm_tag)

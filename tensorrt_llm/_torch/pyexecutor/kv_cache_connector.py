@@ -68,6 +68,10 @@ class RequestData:
     computed_position: int
     # The number of scheduled tokens for the upcoming forward pass.
     num_scheduled_tokens: int
+    # All tokens for this request (full sequence, used by KVBM connector).
+    all_tokens: List[int] = field(default_factory=list)
+    # All block IDs for this request (full list, used by KVBM connector).
+    all_block_ids: List[int] = field(default_factory=list)
 
 
 # A class to store some basic data regarding all inflight requests.
@@ -88,14 +92,19 @@ class KvCacheConnectorWorker(ABC):
         self._metadata = None
         super().__init__()
 
+    @abstractmethod
     def bind_connector_meta(self, metadata: object):
         self._metadata = metadata
 
+    @abstractmethod
+    def clear_connector_meta(self):
+        """
+        Clear the metadata for the worker.
+        """
+        self._metadata = None
+
     def get_connector_meta(self) -> object:
         return self._metadata
-
-    def _clear_connector_meta(self):
-        self._metadata = None
 
     def register_forward_pass_callable(self) -> Callable:
         """
@@ -179,6 +188,7 @@ class KvCacheConnectorWorker(ABC):
         Get handshake metadata for this worker, which gets sent to the leader.
         """
 
+
 class KvCacheConnectorScheduler(ABC):
 
     def __init__(self, llm_args: TorchLlmArgs):
@@ -230,15 +240,27 @@ class KvCacheConnectorScheduler(ABC):
 
     @abstractmethod
     def update_state_after_alloc(self, request: LlmRequest,
-                                 block_ids: List[int]):
+                                 block_ids: List[int],
+                                 num_external_tokens: int):
         """
         Called after get_num_new_matched_tokens is called to provide the block ids to the scheduler.
+
+        In vLLM, this method may be called multiple times for the same request, the first time with the
+        set of blocks to be loaded, in which case `num_external_tokens` will be non-zero, and the subsequent
+        calls will have `num_external_tokens` set to 0 and will include the remaining blocks to be prefilled.
+
+        TODO: Document exactly how the TensorRT-LLM py_executor will call this method.
+
+        TODO: In this changeset, I changed the behavior of the py_executor to to call this method with `num_external_tokens`
+        instead of `num_computed_tokens`. This correct a breaking change to the Connector API and restores the correct
+        calling behavior. Note, this will break our v1 implementation.
 
         Args:
             request: The request that was allocated resources.
             block_ids: The KV cacheblock IDs that were allocated.
+            num_external_tokens: The number of external tokens that need to be loaded.
         """
-    
+
     @abstractmethod
     def set_handshake_metadata(self, metadata: dict[int, object]):
         """
@@ -332,10 +354,13 @@ class KvCacheConnectorSchedulerOutputRequest:
                                        req.context_chunk_size)
         else:
             computed_position = len(tokens) - 1
-            num_scheduled_tokens = 1  # Specdec with draft tokens is not supported yet.
+            # Specdec with draft tokens is not supported yet.
+            num_scheduled_tokens = 1
 
         return RequestData(req.request_id, new_tokens, new_block_ids,
-                           computed_position, num_scheduled_tokens)
+                           computed_position, num_scheduled_tokens,
+                           all_tokens=list(self.tokens),
+                           all_block_ids=list(self.block_ids))
 
 
 class KvCacheConnectorSchedulerOutputManager:
@@ -584,9 +609,14 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         # The execution loop will call _terminate_request on these requests.
         return list(all_finished.saving.values())
 
+    # TODO: This method has been fixed to call `update_state_after_alloc` with `num_external_tokens` instead of `num_computed_tokens`.
+    # This will break our v1 implementation, which has deviated from the Connector API.
     def update_state_after_alloc(self, req: LlmRequest, block_ids: List[int]):
         if self.scheduler is not None:
-            self.scheduler.update_state_after_alloc(req, block_ids)
+            num_external_tokens = self.scheduler_output_manager.external_loads.get(
+                req.request_id, 0)
+            self.scheduler.update_state_after_alloc(
+                req, block_ids, num_external_tokens)
 
     def set_scheduler_output(self, scheduler_output: SchedulerOutput):
         self._scheduler_output = scheduler_output
@@ -596,14 +626,14 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
                                         torch.cuda.current_stream())
 
     def layer_post_hook(self, module, *args):
-        self.worker.save_kv_layer(module.layer_idx, torch.cuda.current_stream())
+        self.worker.save_kv_layer(
+            module.layer_idx, torch.cuda.current_stream())
 
     def handle_handshake_metadata(self):
         worker_metadata = self.worker.get_handshake_metadata()
 
         all_metadata = mpi_allgather(worker_metadata)
-        
+
         if mpi_rank() == 0:
             all_metadata = {i: val for i, val in enumerate(all_metadata)}
             self.scheduler.set_handshake_metadata(all_metadata)
-
